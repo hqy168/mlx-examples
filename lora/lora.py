@@ -1,35 +1,34 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
+import json
 import math
-import numpy as np
-from sentencepiece import SentencePieceProcessor
 import time
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten
-
-
-from llama import LoRALinear, load_model
-import wikisql
+import numpy as np
+import utils as lora_utils
+from mlx.utils import tree_flatten, tree_unflatten
+from models.lora import LoRALinear
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Llama LoRA finetuning")
+    parser = argparse.ArgumentParser(description="LoRA or QLoRA finetuning.")
     parser.add_argument(
-        "--model", required=True, help="The model file containing MLX weights"
-    )
-    parser.add_argument(
-        "--tokenizer", required=True, help="The sentencepiece tokenizer"
+        "--model",
+        default="mlx_model",
+        help="The path to the local model directory or Hugging Face repo.",
     )
     # Generation args
     parser.add_argument(
-        "--num-tokens", "-n", type=int, default=100, help="How many tokens to generate"
-    )
-    parser.add_argument(
-        "--write-every", type=int, default=1, help="After how many tokens to detokenize"
+        "--max-tokens",
+        "-m",
+        type=int,
+        default=100,
+        help="The maximum number of tokens to generate",
     )
     parser.add_argument(
         "--temp", type=float, default=0.8, help="The sampling temperature"
@@ -48,33 +47,51 @@ def build_parser():
         action="store_true",
         help="Do training",
     )
-    parser.add_argument("--batch_size", type=int, default=4, help="Minibatch size.")
+    parser.add_argument(
+        "--data",
+        type=str,
+        default="data/",
+        help="Directory with {train, valid, test}.jsonl files",
+    )
+    parser.add_argument(
+        "--lora-layers",
+        type=int,
+        default=16,
+        help="Number of layers to fine-tune",
+    )
+    parser.add_argument("--batch-size", type=int, default=4, help="Minibatch size.")
     parser.add_argument(
         "--iters", type=int, default=1000, help="Iterations to train for."
     )
     parser.add_argument(
-        "--val_batches",
+        "--val-batches",
         type=int,
-        default=100,
+        default=25,
         help="Number of validation batches, -1 uses the entire validation set.",
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=1e-5, help="Adam learning rate."
+        "--learning-rate", type=float, default=1e-5, help="Adam learning rate."
     )
     parser.add_argument(
-        "--steps_per_report",
+        "--steps-per-report",
         type=int,
         default=10,
         help="Number of training steps between loss reporting.",
     )
     parser.add_argument(
-        "--steps_per_eval",
+        "--steps-per-eval",
         type=int,
         default=200,
         help="Number of training steps between validations.",
     )
     parser.add_argument(
-        "--adapter_file",
+        "--resume-adapter-file",
+        type=str,
+        default=None,
+        help="Load path to resume training with the given adapter weights.",
+    )
+    parser.add_argument(
+        "--adapter-file",
         type=str,
         default="adapters.npz",
         help="Save/load path for the trained adapter weights.",
@@ -85,7 +102,7 @@ def build_parser():
         help="Evaluate on the test set after training",
     )
     parser.add_argument(
-        "--test_batches",
+        "--test-batches",
         type=int,
         default=500,
         help="Number of test set batches, -1 uses the entire test set.",
@@ -94,9 +111,48 @@ def build_parser():
     return parser
 
 
+class Dataset:
+    """
+    Light-weight wrapper to hold lines from a jsonl file
+    """
+
+    def __init__(self, path: Path, key: str = "text"):
+        if not path.exists():
+            self._data = None
+        else:
+            with open(path, "r") as fid:
+                self._data = [json.loads(l) for l in fid]
+        self._key = key
+
+    def __getitem__(self, idx: int):
+        return self._data[idx][self._key]
+
+    def __len__(self):
+        return len(self._data)
+
+
+def load(args):
+    names = ("train", "valid", "test")
+    train, valid, test = (Dataset(Path(args.data) / f"{n}.jsonl") for n in names)
+    if args.train and len(train) == 0:
+        raise ValueError(
+            "Training set not found or empty. Must provide training set for fine-tuning."
+        )
+    if args.train and len(valid) == 0:
+        raise ValueError(
+            "Validation set not found or empty. Must provide validation set for fine-tuning."
+        )
+    if args.test and len(test) == 0:
+        raise ValueError(
+            "Test set not found or empty. Must provide test set for evaluation."
+        )
+    return train, valid, test
+
+
 def loss(model, inputs, targets, lengths):
     # Run model on inputs
-    logits = model(inputs)
+    logits, _ = model(inputs)
+    logits = logits.astype(mx.float32)
 
     # Mask padding tokens
     length_mask = mx.arange(inputs.shape[1])[None, :] < lengths[:, None]
@@ -108,24 +164,36 @@ def loss(model, inputs, targets, lengths):
     return ce, ntoks
 
 
-def iterate_batches(dset, tokenizer, batch_size, shuffle=True):
+def iterate_batches(dset, tokenizer, batch_size, train=False):
     # Shuffle indices
-    indices = np.arange(len(dset))
-    if shuffle:
-        indices = np.random.permutation(indices)
+    while True:
+        indices = np.arange(len(dset))
+        if train:
+            indices = np.random.permutation(indices)
 
-    # Collect batches from dataset
-    for i in range(0, len(indices) - batch_size + 1, batch_size):
-        # Encode batch
-        batch = tokenizer.encode([dset[indices[i + j]] for j in range(batch_size)])
-        lengths = [len(x) for x in batch]
+        # Collect batches from dataset
+        for i in range(0, len(indices) - batch_size + 1, batch_size):
+            # Encode batch
+            batch = [tokenizer.encode(dset[indices[i + j]]) for j in range(batch_size)]
+            lengths = [len(x) for x in batch]
 
-        # Pad to the max length
-        batch_arr = np.zeros((batch_size, max(lengths)), np.int32)
-        for j in range(batch_size):
-            batch_arr[j, : lengths[j]] = batch[j]
-        batch = mx.array(batch_arr)
-        yield batch[:, :-1], batch[:, 1:], mx.array(lengths)
+            # Check if any sequence is longer than 2048 tokens
+            if max(lengths) > 2048:
+                print(
+                    "[WARNING] Some sequences are longer than 2048 tokens. "
+                    "Consider pre-splitting your data to save memory."
+                )
+
+            # Pad to the max length
+            batch_arr = np.zeros((batch_size, max(lengths)), np.int32)
+
+            for j in range(batch_size):
+                batch_arr[j, : lengths[j]] = batch[j]
+            batch = mx.array(batch_arr)
+            yield batch[:, :-1], batch[:, 1:], mx.array(lengths)
+
+        if not train:
+            break
 
 
 def evaluate(model, dataset, loss, tokenizer, batch_size, num_batches):
@@ -133,7 +201,7 @@ def evaluate(model, dataset, loss, tokenizer, batch_size, num_batches):
     ntokens = 0
     for it, batch in zip(
         range(num_batches),
-        iterate_batches(dataset, tokenizer, batch_size, shuffle=False),
+        iterate_batches(dataset, tokenizer, batch_size),
     ):
         losses, toks = loss(model, *batch)
         all_losses.append((losses * toks).item())
@@ -152,7 +220,8 @@ def train(model, train_set, val_set, optimizer, loss, tokenizer, args):
     # Main training loop
     start = time.perf_counter()
     for it, batch in zip(
-        range(args.iters), iterate_batches(train_set, tokenizer, args.batch_size)
+        range(args.iters),
+        iterate_batches(train_set, tokenizer, args.batch_size, train=True),
     ):
         # Forward and backward pass
         (lvalue, toks), grad = loss_value_and_grad(model, *batch)
@@ -195,40 +264,28 @@ def train(model, train_set, val_set, optimizer, loss, tokenizer, args):
 
 
 def generate(model, prompt, tokenizer, args):
-    # Encode prompt
-    x = mx.array([[tokenizer.bos_id()] + tokenizer.encode(prompt)])
+    print(prompt, end="", flush=True)
 
-    skip = 0
-    prompt_processing = None
+    prompt = mx.array(tokenizer.encode(prompt))
+
     tokens = []
-
-    # Genertation loop
-    start = time.perf_counter()
-    for token in model.generate(x, args.temp):
-        tokens.append(token)
-
-        if len(tokens) == 1:
-            # Actually perform the computation to measure the prompt processing time
-            mx.eval(token)
-            prompt_processing = time.perf_counter() - start
-
-        if len(tokens) >= args.num_tokens:
+    skip = 0
+    for token, n in zip(
+        lora_utils.generate(prompt, model, args.temp),
+        range(args.max_tokens),
+    ):
+        if token == tokenizer.eos_token_id:
             break
 
-        if (len(tokens) % args.write_every) == 0:
-            mx.eval(tokens)
-            s = tokenizer.decode([t.item() for t in tokens])
-            print(s[skip:], end="", flush=True)
-            skip = len(s)
-
-    mx.eval(tokens)
-    full_gen = time.perf_counter() - start
-
-    s = tokenizer.decode([t.item() for t in tokens])
-    print(s[skip:], end="", flush=True)
-    print()
-    print(f"Prompt processing took: {prompt_processing:.3f} s")
-    print(f"Full generation took: {full_gen:.3f} s")
+        tokens.append(token.item())
+        s = tokenizer.decode(tokens)
+        print(s[skip:], end="", flush=True)
+        skip = len(s)
+    print(tokenizer.decode(tokens)[skip:], flush=True)
+    print("=" * 10)
+    if len(tokens) == 0:
+        print("No tokens generated for this prompt")
+        return
 
 
 if __name__ == "__main__":
@@ -237,17 +294,14 @@ if __name__ == "__main__":
 
     np.random.seed(args.seed)
 
-    print("Loading tokenizer")
-    tokenizer = SentencePieceProcessor(model_file=args.tokenizer)
-
     print("Loading pretrained model")
-    model = load_model(args.model)
+    model, tokenizer, _ = lora_utils.load(args.model)
 
     # Freeze all layers other than LORA linears
     model.freeze()
-    for l in model.layers[16:32]:
-        l.attention.query_proj = LoRALinear.from_linear(l.attention.query_proj)
-        l.attention.value_proj = LoRALinear.from_linear(l.attention.value_proj)
+    for l in model.model.layers[len(model.model.layers) - args.lora_layers :]:
+        l.self_attn.q_proj = LoRALinear.from_linear(l.self_attn.q_proj)
+        l.self_attn.v_proj = LoRALinear.from_linear(l.self_attn.v_proj)
 
     p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10**6
     print(f"Total parameters {p:.3f}M")
@@ -255,7 +309,12 @@ if __name__ == "__main__":
     print(f"Trainable parameters {p:.3f}M")
 
     print("Loading datasets")
-    train_set, valid_set, test_set = wikisql.load()
+    train_set, valid_set, test_set = load(args)
+
+    # Resume training the given adapters.
+    if args.resume_adapter_file is not None:
+        print(f"Loading pretrained adapters from {args.resume_adapter_file}")
+        model.load_weights(args.resume_adapter_file, strict=False)
 
     if args.train:
         print("Training")
@@ -268,7 +327,12 @@ if __name__ == "__main__":
         mx.savez(args.adapter_file, **dict(tree_flatten(model.trainable_parameters())))
 
     # Load the LoRA adapter weights which we assume should exist by this point
-    model.load_weights(args.adapter_file)
+    if not Path(args.adapter_file).is_file():
+        raise ValueError(
+            f"Adapter file {args.adapter_file} missing. "
+            "Use --train to learn and save the adapters.npz."
+        )
+    model.load_weights(args.adapter_file, strict=False)
 
     if args.test:
         print("Testing")
@@ -287,5 +351,4 @@ if __name__ == "__main__":
 
     if args.prompt is not None:
         print("Generating")
-
         generate(model, args.prompt, tokenizer, args)
