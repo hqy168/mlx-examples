@@ -97,6 +97,12 @@ def build_parser():
         help="Save/load path for the trained adapter weights.",
     )
     parser.add_argument(
+        "--save-every",
+        type=int,
+        default=100,
+        help="Save the model every N iterations.",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="Evaluate on the test set after training",
@@ -132,8 +138,17 @@ class Dataset:
 
 
 def load(args):
+    def load_and_check(name):
+        dataset_path = Path(args.data) / f"{name}.jsonl"
+        try:
+            return Dataset(dataset_path)
+        except Exception as e:
+            print(f"Unable to build dataset {dataset_path} ({e})")
+            raise
+
     names = ("train", "valid", "test")
-    train, valid, test = (Dataset(Path(args.data) / f"{n}.jsonl") for n in names)
+    train, valid, test = (load_and_check(n) for n in names)
+
     if args.train and len(train) == 0:
         raise ValueError(
             "Training set not found or empty. Must provide training set for fine-tuning."
@@ -262,6 +277,13 @@ def train(model, train_set, val_set, optimizer, loss, tokenizer, args):
 
             start = time.perf_counter()
 
+        # Save adapter weights if needed
+        if (it + 1) % args.save_every == 0:
+            mx.savez(
+                args.adapter_file, **dict(tree_flatten(model.trainable_parameters()))
+            )
+            print(f"Iter {it + 1}: Saved adapter weights to {args.adapter_file}.")
+
 
 def generate(model, prompt, tokenizer, args):
     print(prompt, end="", flush=True)
@@ -279,8 +301,9 @@ def generate(model, prompt, tokenizer, args):
 
         tokens.append(token.item())
         s = tokenizer.decode(tokens)
-        print(s[skip:], end="", flush=True)
-        skip = len(s)
+        if len(s) - skip > 1:
+            print(s[skip:-1], end="", flush=True)
+            skip = len(s) - 1
     print(tokenizer.decode(tokens)[skip:], flush=True)
     print("=" * 10)
     if len(tokens) == 0:
@@ -302,6 +325,8 @@ if __name__ == "__main__":
     for l in model.model.layers[len(model.model.layers) - args.lora_layers :]:
         l.self_attn.q_proj = LoRALinear.from_linear(l.self_attn.q_proj)
         l.self_attn.v_proj = LoRALinear.from_linear(l.self_attn.v_proj)
+        if hasattr(l, "block_sparse_moe"):
+            l.block_sparse_moe.gate = LoRALinear.from_linear(l.block_sparse_moe.gate)
 
     p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10**6
     print(f"Total parameters {p:.3f}M")
@@ -336,7 +361,7 @@ if __name__ == "__main__":
 
     if args.test:
         print("Testing")
-
+        model.eval()
         test_loss = evaluate(
             model,
             test_set,
