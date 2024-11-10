@@ -1,5 +1,4 @@
-mlx>=0.1
-safetensors
+mlx>=0.11
 huggingface-hub
 regex
 numpy

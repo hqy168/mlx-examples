@@ -1,14 +1,24 @@
+# Copyright © 2023-2024 Apple Inc.
+
 import argparse
 import glob
-import json
+import shutil
 from pathlib import Path
+from typing import Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import yaml
 from mlx.utils import tree_flatten, tree_map
 
-from .utils import fetch_from_hub, get_model_path, save_weights, upload_to_hub
+from .utils import (
+    fetch_from_hub,
+    get_model_path,
+    save_config,
+    save_weights,
+    upload_to_hub,
+)
 
 
 def configure_parser() -> argparse.ArgumentParser:
@@ -65,7 +75,7 @@ def slerp(t, w1, w2, eps=1e-5):
     return s1 * w1 + s2 * w2
 
 
-def merge_models(base_model, model, config):
+def merge_models(base_model: nn.Module, model: nn.Module, config: dict):
     method = config.get("method", None)
     if method != "slerp":
         raise ValueError(f"Merge method {method} not supported")
@@ -105,7 +115,7 @@ def merge_models(base_model, model, config):
 def merge(
     config: str,
     mlx_path: str = "mlx_model",
-    upload_repo: str = None,
+    upload_repo: Optional[str] = None,
 ):
     with open(config, "r") as fid:
         merge_conf = yaml.safe_load(fid)
@@ -113,7 +123,7 @@ def merge(
 
     model_paths = merge_conf.get("models", [])
     if len(model_paths) < 2:
-        raise ValueError(f"Expected at least 2 models, got {len(models)}.")
+        raise ValueError(f"Expected at least 2 models, got {len(model_paths)}.")
 
     # Load all models
     base_hf_path = model_paths[0]
@@ -121,9 +131,9 @@ def merge(
     base_model, base_config, tokenizer = fetch_from_hub(base_path, lazy=True)
     models = []
     for mp in model_paths[1:]:
-        model, config, _ = fetch_from_hub(get_model_path(mp), lazy=True)
+        model, model_config, _ = fetch_from_hub(get_model_path(mp), lazy=True)
         base_type = base_config["model_type"]
-        model_type = config["model_type"]
+        model_type = model_config["model_type"]
         if base_type != model_type:
             raise ValueError(
                 f"Can only merge models of the same type,"
@@ -146,14 +156,17 @@ def merge(
 
     tokenizer.save_pretrained(mlx_path)
 
-    with open(mlx_path / "config.json", "w") as fid:
-        json.dump(base_config, fid, indent=4)
+    save_config(config, config_path=mlx_path / "config.json")
 
     if upload_repo is not None:
         upload_to_hub(mlx_path, upload_repo, base_hf_path)
 
 
-if __name__ == "__main__":
+def main():
     parser = configure_parser()
     args = parser.parse_args()
     merge(**vars(args))
+
+
+if __name__ == "__main__":
+    main()

@@ -12,3 +12,6 @@ MLX Examples was developed with contributions from the following individuals:
 - Shunta Saito: Added support for PLaMo models.
 - Gabrijel Boduljak: Implemented `CLIP`.
 - Markus Enzweiler: Added the `cvae` examples.
+- Prince Canuma: Helped add support for `Starcoder2` models.
+- Shiyu Li: Added the `Segment Anything Model`.
+- Gökdeniz Gülmez: Added support for `MiniCPM`, `Mamba` and support for `full-fine-tuning`.

@@ -1,19 +1,27 @@
 import argparse
 import glob
-import json
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Union
 
 from mlx.utils import tree_flatten, tree_unflatten
 
-from .tuner.lora import LoRALinear
-from .tuner.utils import apply_lora_layers, dequantize
-from .utils import fetch_from_hub, get_model_path, save_weights, upload_to_hub
+from .gguf import convert_to_gguf
+from .tuner.dora import DoRAEmbedding, DoRALinear
+from .tuner.lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
+from .tuner.utils import dequantize, load_adapters
+from .utils import (
+    fetch_from_hub,
+    get_model_path,
+    save_config,
+    save_weights,
+    upload_to_hub,
+)
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LoRA or QLoRA finetuning.")
+    parser = argparse.ArgumentParser(
+        description="Fuse fine-tuned adapters into the base model."
+    )
     parser.add_argument(
         "--model",
         default="mlx_model",
@@ -21,14 +29,14 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--save-path",
-        default="lora_fused_model",
+        default="fused_model",
         help="The path to save the fused model.",
     )
     parser.add_argument(
-        "--adapter-file",
+        "--adapter-path",
         type=str,
-        default="adapters.npz",
-        help="Path to the trained adapter weights (npz or safetensors).",
+        default="adapters",
+        help="Path to the trained adapter weights and config.",
     )
     parser.add_argument(
         "--hf-path",
@@ -47,6 +55,17 @@ def parse_arguments() -> argparse.Namespace:
         help="Generate a de-quantized model.",
         action="store_true",
     )
+    parser.add_argument(
+        "--export-gguf",
+        help="Export model weights in GGUF format.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--gguf-path",
+        help="Path to save the exported GGUF format model weights. Default is ggml-model-f16.gguf.",
+        default="ggml-model-f16.gguf",
+        type=str,
+    )
     return parser.parse_args()
 
 
@@ -58,15 +77,14 @@ def main() -> None:
     model, config, tokenizer = fetch_from_hub(model_path)
 
     model.freeze()
-    model = apply_lora_layers(model, args.adapter_file)
+    model = load_adapters(model, args.adapter_path)
 
     fused_linears = [
-        (n, m.to_linear())
-        for n, m in model.named_modules()
-        if isinstance(m, LoRALinear)
+        (n, m.fuse()) for n, m in model.named_modules() if hasattr(m, "fuse")
     ]
 
-    model.update_modules(tree_unflatten(fused_linears))
+    if fused_linears:
+        model.update_modules(tree_unflatten(fused_linears))
 
     if args.de_quantize:
         print("De-quantizing model")
@@ -87,8 +105,15 @@ def main() -> None:
     if args.de_quantize:
         config.pop("quantization", None)
 
-    with open(save_path / "config.json", "w") as fid:
-        json.dump(config, fid, indent=4)
+    save_config(config, config_path=save_path / "config.json")
+
+    if args.export_gguf:
+        model_type = config["model_type"]
+        if model_type not in ["llama", "mixtral", "mistral"]:
+            raise ValueError(
+                f"Model type {model_type} not supported for GGUF conversion."
+            )
+        convert_to_gguf(model_path, weights, config, str(save_path / args.gguf_path))
 
     if args.upload_repo is not None:
         hf_path = args.hf_path or (

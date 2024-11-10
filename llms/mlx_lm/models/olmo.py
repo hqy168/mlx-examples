@@ -1,18 +1,19 @@
+# Copyright © 2023-2024 Apple Inc.
+
+import sys
 from dataclasses import dataclass
-from sys import exit
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs
-from .layers import LayerNorm
+from .base import BaseModelArgs, create_attention_mask
 
 try:
     import hf_olmo
 except ImportError:
     print("To run olmo install ai2-olmo: pip install ai2-olmo")
-    exit(1)
+    sys.exit(1)
 
 
 @dataclass
@@ -24,7 +25,6 @@ class ModelArgs(BaseModelArgs):
     n_heads: int
     vocab_size: int
     embedding_size: int
-    model_type: str
     rope_theta: float = 10000
     rope_traditional: bool = False
     mlp_ratio: int = 4
@@ -47,8 +47,8 @@ class TransformerBlock(nn.Module):
         self.ff_proj = nn.Linear(dim, args.mlp_hidden_size, bias=False)
         self.ff_out = nn.Linear(args.mlp_hidden_size // 2, dim, bias=False)
 
-        self.att_norm = LayerNorm(dim, affine=False)
-        self.ff_norm = LayerNorm(dim, affine=False)
+        self.att_norm = nn.LayerNorm(dim, affine=False)
+        self.ff_norm = nn.LayerNorm(dim, affine=False)
 
         head_dim = dim // self.n_heads
         self.scale = head_dim**-0.5
@@ -68,7 +68,7 @@ class TransformerBlock(nn.Module):
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Tuple[mx.array, mx.array]] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -80,11 +80,9 @@ class TransformerBlock(nn.Module):
         values = values.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            key_cache, value_cache = cache
-            queries = self.rope(queries, offset=key_cache.shape[2])
-            keys = self.rope(keys, offset=key_cache.shape[2])
-            keys = mx.concatenate([key_cache, keys], axis=2)
-            values = mx.concatenate([value_cache, values], axis=2)
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
@@ -94,21 +92,21 @@ class TransformerBlock(nn.Module):
             scores += mask
         scores = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
         output = (scores @ values).transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.attn_out(output), (keys, values)
+        return self.attn_out(output)
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Tuple[mx.array, mx.array]] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
-        r, cache = self.attend(self.att_norm(x), mask, cache)
+        r = self.attend(self.att_norm(x), mask, cache)
         h = x + r
 
         x1, x2 = mx.split(self.ff_proj(self.ff_norm(h)), 2, axis=-1)
 
         out = h + self.ff_out(nn.silu(x2) * x1)
-        return out, cache
+        return out
 
 
 class Transformer(nn.Module):
@@ -121,7 +119,7 @@ class Transformer(nn.Module):
         self.blocks = [TransformerBlock(args=args) for _ in range(args.n_layers)]
         if not self.weight_tying:
             self.ff_out = nn.Linear(args.d_model, args.embedding_size, bias=False)
-        self.norm = LayerNorm(args.d_model, affine=False)
+        self.norm = nn.LayerNorm(args.d_model, affine=False)
 
     def __call__(
         self,
@@ -130,23 +128,20 @@ class Transformer(nn.Module):
     ):
         h = self.wte(inputs)
 
-        mask = None
-        if h.shape[1] > 1:
-            mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
-            mask = mask.astype(h.dtype)
+        mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * len(self.blocks)
 
-        for e, block in enumerate(self.blocks):
-            h, cache[e] = block(h, mask, cache[e])
+        for block, c in zip(self.blocks, cache):
+            h = block(h, mask, c)
 
         h = self.norm(h)
 
         if self.weight_tying:
-            return h @ self.wte.weight.T, cache
+            return self.wte.as_linear(h), cache
 
-        return self.ff_out(h), cache
+        return self.ff_out(h)
 
 
 class OlmoModel(nn.Module):
@@ -167,6 +162,7 @@ class Model(nn.Module):
         super().__init__()
         self.model_type = args.model_type
         self.model = OlmoModel(args)
+        self.args = args
 
     def __call__(
         self,

@@ -1,4 +1,9 @@
-from .convert import convert
-from .utils import generate, load
+# Copyright © 2023-2024 Apple Inc.
 
-__version__ = "0.0.14"
+import os
+
+from ._version import __version__
+
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
+from .utils import convert, generate, load, stream_generate
